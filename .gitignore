@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Project data and generated outputs
+data/
+outputs/
+figures/
+tables/
+appendices/
+*.parquet
+*.feather
+*.gpkg
+*.graphml
+*.geojson
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.tif
+*.tiff
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Local logs and scratch files
+*.log
+*.jsonl
+run_log/
+tmp/
+temp/

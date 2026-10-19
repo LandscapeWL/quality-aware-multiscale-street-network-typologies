@@ -80,6 +80,7 @@ OUTPUT_FILES = {
     "robust_unweighted": "robustness_unweighted_vs_weighted.csv",
     "robust_small": "robustness_remove_small_groups.csv",
     "robust_md": "robustness_summary.md",
+    "robust_primary": "robustness_primary_contrasts.csv",
     "figure_circuity": "figure_data_morphotype_circuity.csv",
     "figure_access": "figure_data_accessibility_by_type.csv",
     "figure_inequality": "figure_data_inequality.csv",
@@ -168,6 +169,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD)
     parser.add_argument("--small-group-min-units", type=int, default=DEFAULT_SMALL_GROUP_MIN_UNITS)
+    parser.add_argument(
+        "--refresh-weighting-only", action="store_true",
+        help="Refit WLS/OLS on common samples from saved model tables; update only robustness outputs and provenance.",
+    )
     parser.add_argument(
         "--snap-tail-quantile",
         type=float,
@@ -1257,7 +1262,9 @@ def fit_formula_model(
             scenario,
             n_input,
         )
-    model_df = data.copy().replace([np.inf, -np.inf], np.nan).reset_index(drop=True)
+    model_df = data.copy().replace([np.inf, -np.inf], np.nan)
+    model_df["_audit_source_row"] = data.index.astype(str)
+    model_df = model_df.reset_index(drop=True)
     if outcome not in model_df.columns:
         return error_model_result(model_id, model_family, outcome, formula, "failed", "outcome column missing", scenario, n_input)
     model_df[outcome] = pd.to_numeric(model_df[outcome], errors="coerce")
@@ -1315,6 +1322,9 @@ def fit_formula_model(
         pvalues = np.asarray(result.pvalues)
         ci = np.asarray(result.conf_int())
         nobs = int(result.nobs)
+        used_rows = model_df.loc[fit.model.data.row_labels]
+        sample_hash = hashlib.sha256("\n".join(used_rows["_audit_source_row"]).encode()).hexdigest()
+        n_clusters = int(used_rows[cluster_col].nunique()) if cluster_col in used_rows else 0
         warn_text = "; ".join(str(w.message) for w in caught[:5])
         if cov_message:
             warn_text = f"{warn_text}; {cov_message}" if warn_text else cov_message
@@ -1343,6 +1353,8 @@ def fit_formula_model(
                     "bic": float(getattr(result, "bic", np.nan)),
                     "df_resid": float(getattr(result, "df_resid", np.nan)),
                     "cov_type": cov_type_used,
+                    "n_clusters": n_clusters,
+                    "sample_row_sha256": sample_hash,
                     "weight_col": weight_col,
                     "cluster_col": cluster_col,
                     "formula": formula,
@@ -1359,6 +1371,8 @@ def fit_formula_model(
             "weight_col": weight_col,
             "cluster_col": cluster_col,
             "cov_type": cov_type_used,
+            "n_clusters": n_clusters,
+            "sample_row_sha256": sample_hash,
             "n_input": n_input,
             "nobs": nobs,
             "dropped_n": int(n_input - nobs),
@@ -1510,15 +1524,44 @@ def compare_weighted_unweighted(weighted_df: pd.DataFrame, unweighted_df: pd.Dat
     lhs = key_terms(weighted_df).copy()
     rhs = key_terms(unweighted_df).copy()
     cols = ["model_family", "model_id", "outcome", "term"]
-    merged = lhs[cols + ["coef", "std_err", "p_value", "nobs"]].merge(
-        rhs[cols + ["coef", "std_err", "p_value", "nobs"]],
+    values = ["coef", "std_err", "p_value", "ci_low", "ci_high", "nobs", "cov_type", "n_clusters", "sample_row_sha256"]
+    merged = lhs[cols + values].merge(
+        rhs[cols + values],
         on=cols,
         how="outer",
         suffixes=("_weighted", "_unweighted"),
+        validate="one_to_one",
     )
+    merged["same_sample_flag"] = merged["nobs_weighted"].eq(merged["nobs_unweighted"]) & merged["sample_row_sha256_weighted"].eq(merged["sample_row_sha256_unweighted"])
+    if not merged["same_sample_flag"].all():
+        raise ValueError("Weighted/unweighted models must use identical formula-complete rows.")
+    merged["sample_policy"] = "same_formula_complete_rows_with_positive_finite_baseline_weight"
     merged["coef_difference_unweighted_minus_weighted"] = merged["coef_unweighted"] - merged["coef_weighted"]
     merged["same_sign_flag"] = np.sign(merged["coef_weighted"]) == np.sign(merged["coef_unweighted"])
     return merged
+
+
+def run_common_sample_weighting(model_a_table, model_b_table, model_c_table):
+    """Change only weights; formula-specific missingness is checked after fitting."""
+    weighted_frames, unweighted_frames, infos = [], [], []
+    for runner, data, weight in [
+        (run_model_a, model_a_table, "od_model_weight"),
+        (run_model_b, model_b_table, "facility_model_weight"),
+        (run_model_c, model_c_table, "inequality_model_weight"),
+    ]:
+        w_numeric = pd.to_numeric(data[weight], errors="coerce")
+        common = data.loc[w_numeric.gt(0) & np.isfinite(w_numeric)].copy()
+        print(f"Common-sample weighting: {runner.__name__}, {len(common)}/{len(data)} weight-eligible rows", flush=True)
+        w, wi = runner(common, scenario="weighted_reference", weighted=True)
+        u, ui = runner(common, scenario="unweighted", weighted=False)
+        if any(i["status"] != "ok" for i in wi + ui):
+            raise RuntimeError(f"Weighting refit failed: {wi + ui}")
+        weighted_frames.append(w)
+        unweighted_frames.append(u)
+        infos.extend(wi + ui)
+    weighted = pd.concat(weighted_frames, ignore_index=True)
+    unweighted = pd.concat(unweighted_frames, ignore_index=True)
+    return weighted, unweighted, compare_weighted_unweighted(weighted, unweighted), infos
 
 
 def run_robustness(
@@ -1552,22 +1595,10 @@ def run_robustness(
         infos.extend(info)
     high_conf = pd.concat(high_frames, ignore_index=True)
 
-    weighted_frames: list[pd.DataFrame] = []
-    unweighted_frames: list[pd.DataFrame] = []
-    for runner, data in [
-        (run_model_a, model_a_table),
-        (run_model_b, model_b_table),
-        (run_model_c, model_c_table),
-    ]:
-        w, info_w = runner(data, scenario="weighted_reference", weighted=True)
-        u, info_u = runner(data, scenario="unweighted", weighted=False)
-        weighted_frames.append(w)
-        unweighted_frames.append(u)
-        infos.extend(info_w)
-        infos.extend(info_u)
-    weighted_ref = pd.concat(weighted_frames, ignore_index=True)
-    unweighted = pd.concat(unweighted_frames, ignore_index=True)
-    unweighted_vs_weighted = compare_weighted_unweighted(weighted_ref, unweighted)
+    weighted_ref, unweighted, unweighted_vs_weighted, weight_infos = run_common_sample_weighting(
+        model_a_table, model_b_table, model_c_table
+    )
+    infos.extend(weight_infos)
 
     small_a = model_a_table[
         pd.to_numeric(model_a_table["od_pair_count"], errors="coerce").ge(30)
@@ -2091,6 +2122,8 @@ def build_robustness_summary_table(
     unweighted_vs_weighted: pd.DataFrame,
     remove_small: pd.DataFrame,
     model_infos: list[dict[str, Any]],
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    small_group_min_units: int = DEFAULT_SMALL_GROUP_MIN_UNITS,
 ) -> pd.DataFrame:
     info_df = pd.DataFrame(model_infos)
     rows = [
@@ -2099,21 +2132,21 @@ def build_robustness_summary_table(
             "coefficient_rows": len(high_conf),
             "model_count": int(high_conf["model_id"].nunique()) if "model_id" in high_conf.columns else 0,
             "ok_rows": int(high_conf["status"].eq("ok").sum()) if "status" in high_conf.columns else 0,
-            "note": f"type_confidence >= {DEFAULT_CONFIDENCE_THRESHOLD}",
+            "note": f"A/C group mean_type_confidence >= {confidence_threshold}; B unit type_confidence >= threshold",
         },
         {
             "scenario": "unweighted_vs_weighted",
             "coefficient_rows": len(unweighted_vs_weighted),
             "model_count": int(unweighted_vs_weighted["model_id"].nunique()) if "model_id" in unweighted_vs_weighted.columns else 0,
             "ok_rows": int(unweighted_vs_weighted["same_sign_flag"].notna().sum()) if "same_sign_flag" in unweighted_vs_weighted.columns else 0,
-            "note": "main population/OD weights compared with unweighted models",
+            "note": "WLS vs OLS on identical positive-weight, formula-complete rows; sample hashes verified",
         },
         {
             "scenario": "remove_small_groups",
             "coefficient_rows": len(remove_small),
             "model_count": int(remove_small["model_id"].nunique()) if "model_id" in remove_small.columns else 0,
             "ok_rows": int(remove_small["status"].eq("ok").sum()) if "status" in remove_small.columns else 0,
-            "note": "OD pair count >=30/100, Model C unit_count >=30, Model B city-type unit_count >=3",
+            "note": f"OD pair count >=30/100, Model C unit_count >=30, Model B city-type unit_count >={small_group_min_units}",
         },
     ]
     if not info_df.empty:
@@ -2136,6 +2169,7 @@ def build_result_summary(
     model_results: pd.DataFrame,
     robustness_unweighted: pd.DataFrame,
     snap_info: dict[str, Any],
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> dict[str, Any]:
     circ = descriptive["circuity_by_morphotype"].copy()
     circ_col = "od_circuity_weighted_mean_weighted_mean"
@@ -2185,7 +2219,9 @@ def build_result_summary(
         "model_c_morphotype_terms": model_c_type_terms.to_dict("records"),
         "robustness": {
             "weighted_vs_unweighted_same_sign_share": stable,
-            "high_confidence_threshold": DEFAULT_CONFIDENCE_THRESHOLD,
+            "weighting_sample_policy": "Identical positive-finite-weight formula-complete rows, verified by sample hash.",
+            "primary_contrasts_file": OUTPUT_FILES["robust_primary"],
+            "high_confidence_threshold": confidence_threshold,
             "snap_tail_policy": snap_info,
         },
         "caution": [
@@ -2240,7 +2276,8 @@ def write_result_summary(path_md: Path, path_json: Path, summary: dict[str, Any]
         "",
         "## Robustness",
         "",
-        f"- Share of key coefficients with the same sign in weighted and unweighted models: {summary['robustness']['weighted_vs_unweighted_same_sign_share']}",
+        f"- Same-sample weighted/unweighted coefficient sign agreement: {summary['robustness']['weighted_vs_unweighted_same_sign_share']} (includes morphotype main terms, interactions, and controls; auxiliary diagnostic only)",
+        "- Primary contrast coefficients, 95% CIs, and effective sample sizes are in robustness_primary_contrasts.csv; B/C contrasts are conditional on grocery.",
         f"- High-confidence threshold: {summary['robustness']['high_confidence_threshold']}",
         f"- Snapping long-tail policy: {summary['robustness']['snap_tail_policy']['policy']}",
         "",
@@ -2258,6 +2295,10 @@ def write_robustness_summary(
     unweighted_vs_weighted: pd.DataFrame,
     remove_small: pd.DataFrame,
     snap_info: dict[str, Any],
+    *,
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    small_group_min_units: int = DEFAULT_SMALL_GROUP_MIN_UNITS,
+    reused_existing_scenarios: bool = False,
 ) -> None:
     same_sign = (
         float(unweighted_vs_weighted["same_sign_flag"].dropna().mean())
@@ -2269,9 +2310,9 @@ def write_robustness_summary(
         "",
         "## Executed Scenarios",
         "",
-        f"- High-confidence subsample: type_confidence >= {DEFAULT_CONFIDENCE_THRESHOLD} or city-morphotype mean confidence reaches that threshold.",
-        "- Weighted vs unweighted: main models use population/OD weights; diagnostic models do not use weights.",
-        f"- Very small group filter: morphotype-city groups with unit_count < {DEFAULT_SMALL_GROUP_MIN_UNITS} or very small OD pair counts are removed in robustness checks.",
+        f"- High-confidence subsample: A/C use city-morphotype group mean_type_confidence >= {confidence_threshold}; B uses unit type_confidence at the same threshold.",
+        "- Weighted vs unweighted: WLS and OLS use identical positive-finite-weight, formula-complete rows; sample row hashes and nobs are verified after fitting. All models cluster by city_id.",
+        f"- Small-group filters: A OD pair count >=30/100; B city-type unit_count >={small_group_min_units}; C unit_count >=30.",
         "- Snapping long tail: flagged only, not hard-deleted.",
         "",
         "## Results Overview",
@@ -2279,13 +2320,25 @@ def write_robustness_summary(
         f"- High-confidence model coefficient rows: {len(high_conf)}",
         f"- Unweighted comparison rows: {len(unweighted_vs_weighted)}",
         f"- Small-group filtered model coefficient rows: {len(remove_small)}",
-        f"- Share of key coefficients with the same sign in weighted/unweighted models: {same_sign}",
+        f"- Same-sample weighted/unweighted coefficient sign agreement: {same_sign}; includes morphotype main terms, interactions, and controls. This is an auxiliary diagnostic, not a measure of primary contrast stability.",
         f"- Snapping long-tail threshold: {snap_info.get('snap_distance_threshold_m')} m",
         f"- Snapping long-tail row share: {snap_info.get('long_snap_distance_row_share')}",
         "",
         "Detailed coefficients are in `robustness_high_confidence.csv`, `robustness_unweighted_vs_weighted.csv`, `robustness_remove_small_groups.csv`, and `robustness_results.xlsx`.",
         "",
     ]
+    primary_path = path.parent / OUTPUT_FILES["robust_primary"]
+    if primary_path.exists():
+        primary = pd.read_csv(primary_path)
+        lines += [
+            "## Primary Contrast Magnitudes and Intervals", "",
+            "A uses log OD mean circuity; B uses accessibility_score conditional on grocery; C uses accessibility_gini conditional on grocery. All contrasts are relative to MT01. B/C are not effects averaged across facility categories.", "",
+            ("Existing high-confidence and small-group fits are reused; only common-sample weighted/unweighted models are refitted. Main models and figure inputs are unchanged." if reused_existing_scenarios else "This full run refits main models and all robustness scenarios and updates the corresponding figure inputs."), "",
+            markdown_table(primary[["scenario", "model_group", "morphotype", "coef", "ci_low", "ci_high", "nobs"]], max_rows=100), "",
+        ]
+        crosses = primary[primary["interval_includes_zero"].eq(True)]
+        labels = [f"{r.scenario} / {r.model_group} / {r.morphotype}" for r in crosses.itertuples()]
+        lines += [("Contrasts with 95% intervals including zero: " + "; ".join(labels) + "." if labels else "All listed primary contrasts have 95% intervals excluding zero."), "Point-estimate direction and interval inclusion of zero are reported separately; an interval crossing zero is not interpreted as a reversal in direction.", ""]
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -2371,11 +2424,18 @@ def write_readme(paths: StepPaths, args: argparse.Namespace) -> None:
         "- Model A: `log(od_circuity_weighted_mean)` / `od_circuity_weighted_mean` etc. ~ `C(origin_morphotype)+C(city_id)`, with `route_found_weight_sum` weights and fallback to `od_pair_weight_sum` when missing.",
         "- Model B: unit-facility long table, `access_15min` and `accessibility_score` ~ `C(morphotype)*C(category)+C(city_id)+type_confidence`, with population weights.",
         "- Model C: city_morphotype-category table, three inequality/accessibility outcomes ~ `C(morphotype)*C(category)+minimum city controls`.",
+        "- All baseline specifications use WLS; binary outcomes in Model B use linear probability models. A/B include city fixed effects, while C adjusts measured city covariates and may retain unmeasured city confounding.",
+        "- A/B/C contain 5/7/3 specifications (15 total). MT01 is the morphotype reference. B/C morphotype main terms in pooled interactions are contrasts conditional on grocery, not category-average effects.",
+        "- Weighted/unweighted comparisons use identical positive-finite-weight, formula-complete rows. In the manuscript data, B has 370,040 rows after excluding 4,265 non-positive/missing-weight rows (853 units x 5 categories); this comparison does not apply a small-group filter.",
+        f"- High-confidence filtering uses group mean_type_confidence for A/C and unit type_confidence for B, at threshold {args.confidence_threshold}. Small-group filters are A OD pairs >=30/100; B city-type unit_count >={args.small_group_min_units}; C unit_count >=30.",
         "- Minimum controls prioritize `log(ucdb_pop_2025)`, `log(ucdb_area_km2)`, `ghsl_built_share_2020_100m`, and `quality_score`; missing fields are recorded as fallbacks in the log. `quality_tier` and `quality_weight` are not used as valid explanatory variables.",
         "",
         "## Run Command",
         "",
-        f"```bash\npython code_upload/11_statistical_models_robustness_checks/step11_model_robustness.py --root {args.root}\n```",
+        f'```bash\npython "code_upload/11_statistical_models_robustness_checks/step11_model_robustness.py" --root "{args.root}"\n```',
+        "",
+        "Refresh common-sample weighting robustness only (reuse saved model tables and high-confidence/small-group fits, verify WLS against the locked baseline, and preserve main models and figure inputs):",
+        f'```bash\npython "code_upload/11_statistical_models_robustness_checks/step11_model_robustness.py" --root "{args.root}" --refresh-weighting-only\n```',
         "",
         "## Outputs",
         "",
@@ -2383,6 +2443,19 @@ def write_readme(paths: StepPaths, args: argparse.Namespace) -> None:
         "",
     ]
     (paths.output_dir / OUTPUT_FILES["readme"]).write_text("\n".join(lines), encoding="utf-8")
+
+
+def exclude_provenance_hashes(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Avoid self/cross-referential hashes for the two mutable audit documents."""
+    return {name: value for name, value in metadata.items() if name not in {OUTPUT_FILES["run_log"], OUTPUT_FILES["repro"]}}
+
+
+PROVENANCE_HASH_POLICY = "output_metadata excludes 11_run_log.json and reproducibility_status_manifest.json to avoid self/cross-referential hashes; all other entries hash complete file bytes."
+
+
+def model_audit_records(model_infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fields = ["model_id", "scenario", "outcome", "formula", "weight_col", "cluster_col", "nobs", "n_clusters", "cov_type", "sample_row_sha256", "status", "converged"]
+    return [{key: info.get(key) for key in fields} for info in model_infos]
 
 
 def write_repro(
@@ -2404,25 +2477,104 @@ def write_repro(
         "git_state": git_state(paths.root),
         "input_report_status": input_report.get("status"),
         "main_scope": input_report.get("main_scope"),
-        "model_formulas": [
-            {
-                "model_id": info.get("model_id"),
-                "scenario": info.get("scenario"),
-                "outcome": info.get("outcome"),
-                "formula": info.get("formula"),
-                "weight_col": info.get("weight_col"),
-                "cluster_col": info.get("cluster_col"),
-                "nobs": info.get("nobs"),
-                "status": info.get("status"),
-                "converged": info.get("converged"),
-            }
-            for info in model_infos
-        ],
-        "nan_policy": "Model-specific missing outcomes, non-finite predictors generated by formulas, and non-positive weights are dropped by statsmodels/explicit filters. Main data rows are not altered upstream.",
-        "small_group_policy": f"Main analysis retains small groups; robustness removes unit_count < {args.small_group_min_units}.",
-        "output_metadata": {p.name: file_metadata(p) for p in output_paths if p.exists()},
+        "model_formulas": model_audit_records(model_infos),
+        "nan_policy": "Model-specific missing outcomes, non-finite predictors generated by formulas, and non-positive weights are dropped by statsmodels/explicit filters. Both weighting estimators use identical positive-finite-weight formula-complete rows. Main data rows are not altered upstream.",
+        "small_group_policy": f"A OD pairs>=30/100; B city-type units>={args.small_group_min_units}; C units>=30.",
+        "output_metadata": exclude_provenance_hashes({p.name: file_metadata(p) for p in output_paths if p.exists()}),
+        "output_metadata_hash_policy": PROVENANCE_HASH_POLICY,
     }
     write_json(paths.output_dir / OUTPUT_FILES["repro"], repro)
+
+
+def build_primary_contrasts(*frames: pd.DataFrame) -> pd.DataFrame:
+    data = pd.concat(frames, ignore_index=True)
+    outcomes = {"log_od_circuity_weighted_mean": "A", "accessibility_score": "B", "accessibility_gini": "C"}
+    selected = data[
+        data["outcome"].isin(outcomes)
+        & data["term"].str.contains(r"\[T\.MT(?:07|08|09|10)\]$", regex=True)
+        & ~data["term"].str.contains(":", regex=False)
+    ].copy()
+    selected["morphotype"] = selected["term"].str.extract(r"\[T\.(MT\d+)\]$")
+    selected["model_group"] = selected["outcome"].map(outcomes)
+    selected["contrast_scope"] = np.where(selected["model_group"].eq("A"), "versus_MT01_city_FE_log_OD", "versus_MT01_conditional_on_grocery")
+    selected["interval_excludes_zero"] = selected["ci_low"].gt(0) | selected["ci_high"].lt(0)
+    selected["interval_includes_zero"] = ~selected["interval_excludes_zero"]
+    baseline = selected[selected["scenario"].isin(["main", "main_unit_count_ge_20"])][["model_group", "morphotype", "coef"]].rename(columns={"coef": "baseline_coef"})
+    selected = selected.merge(baseline, on=["model_group", "morphotype"], validate="many_to_one")
+    selected["coefficient_difference_from_baseline"] = selected["coef"] - selected["baseline_coef"]
+    selected["same_direction_as_baseline"] = np.sign(selected["coef"]).eq(np.sign(selected["baseline_coef"]))
+    return selected[["scenario", "model_group", "model_id", "outcome", "morphotype", "contrast_scope", "coef", "ci_low", "ci_high", "std_err", "p_value", "nobs", "cov_type", "baseline_coef", "coefficient_difference_from_baseline", "same_direction_as_baseline", "interval_excludes_zero", "interval_includes_zero"]].sort_values(["model_group", "morphotype", "scenario"])
+
+
+def refresh_weighting_only(paths: StepPaths, args: argparse.Namespace) -> None:
+    """Surgical update: protect baseline estimates and figure source data."""
+    start = time.time()
+    out = paths.output_dir
+    protected_keys = ["model_a_csv", "model_b_csv", "model_c_csv", "figure_circuity", "figure_access", "figure_inequality", "table_model", "coef_csv", "coef_xlsx", "marginal_effects", "model_xlsx", "robust_high_conf", "robust_small"]
+    protected = {OUTPUT_FILES[k]: file_sha256(out / OUTPUT_FILES[k]) for k in protected_keys}
+    baseline = pd.concat([pd.read_csv(out / OUTPUT_FILES[k]) for k in ["model_a_csv", "model_b_csv", "model_c_csv"]], ignore_index=True)
+    tables = [pd.read_parquet(out / OUTPUT_FILES[k]) for k in ["model_table_a_parquet", "model_table_b_parquet", "model_table_c_parquet"]]
+    weighted, unweighted, comparison, new_infos = run_common_sample_weighting(*tables)
+    keys = ["model_id", "outcome", "term"]
+    paired = baseline.merge(weighted, on=keys, suffixes=("_locked", "_refit"), validate="one_to_one")
+    if len(paired) != len(baseline) or len(paired) != len(weighted):
+        raise ValueError("WLS refit has a different coefficient set from the locked baseline.")
+    errors = {}
+    for field in ["coef", "std_err", "ci_low", "ci_high", "nobs"]:
+        errors[field] = float((paired[field + "_locked"] - paired[field + "_refit"]).abs().max())
+        if not np.allclose(paired[field + "_locked"], paired[field + "_refit"], atol=1e-9, rtol=1e-7, equal_nan=True):
+            raise ValueError(f"Locked baseline mismatch: {field}, max absolute difference {errors[field]}")
+    if not weighted["cov_type"].eq("cluster").all() or not unweighted["cov_type"].eq("cluster").all():
+        raise ValueError("Expected city-cluster covariance in every refit.")
+    if not weighted["n_clusters"].eq(48).all() or not unweighted["n_clusters"].eq(48).all():
+        raise ValueError("Expected all 48 cities in every weighting comparison.")
+    if not np.isfinite(pd.concat([weighted, unweighted])[["coef", "std_err", "ci_low", "ci_high"]].to_numpy()).all():
+        raise ValueError("Non-finite estimates or intervals in weighting refits.")
+    high = pd.read_csv(out / OUTPUT_FILES["robust_high_conf"])
+    small = pd.read_csv(out / OUTPUT_FILES["robust_small"])
+    old_log = json.loads((out / OUTPUT_FILES["run_log"]).read_text())
+    # These filters describe reused fits, so take their settings from the saved run.
+    confidence_threshold = old_log["args"]["confidence_threshold"]
+    small_group_min_units = old_log["args"]["small_group_min_units"]
+    infos = [i for i in old_log["model_infos"] if i["scenario"] not in ["weighted_reference", "unweighted"]] + new_infos
+    combined = pd.concat([high.assign(robustness_file="robustness_high_confidence"), unweighted.assign(robustness_file="robustness_unweighted"), small.assign(robustness_file="robustness_remove_small_groups")], ignore_index=True)
+    summary_table = build_robustness_summary_table(high, comparison, small, [i for i in infos if i["scenario"] not in ["main", "main_unit_count_ge_20"]], confidence_threshold, small_group_min_units)
+    primary = build_primary_contrasts(baseline, high, unweighted, small)
+    # All gates above precede the first output mutation.
+    for key, table in [("robust_unweighted", comparison), ("table_robust", combined), ("robust_summary_table", summary_table), ("robust_primary", primary)]:
+        write_csv(table, out / OUTPUT_FILES[key])
+    write_excel(out / OUTPUT_FILES["robust_xlsx"], {"high_confidence": high, "unweighted_vs_weighted": comparison, "remove_small_groups": small, "summary": summary_table, "combined": combined, "primary_contrasts": primary})
+    write_robustness_summary(out / OUTPUT_FILES["robust_md"], high, comparison, small, old_log["snap_info"], confidence_threshold=confidence_threshold, small_group_min_units=small_group_min_units, reused_existing_scenarios=True)
+    summary = json.loads((out / OUTPUT_FILES["summary_json"]).read_text())
+    summary["robustness"]["weighted_vs_unweighted_same_sign_share"] = float(comparison["same_sign_flag"].mean())
+    summary["robustness"]["weighting_sample_policy"] = "Identical positive-finite-weight formula-complete rows, verified by sample hash; all 48 city clusters."
+    summary["robustness"]["primary_contrasts_file"] = OUTPUT_FILES["robust_primary"]
+    summary["robustness"]["weighting_refreshed_at"] = now_iso()
+    write_result_summary(out / OUTPUT_FILES["summary_md"], out / OUTPUT_FILES["summary_json"], summary)
+    (out / OUTPUT_FILES["model_explanation_md"]).write_text((out / OUTPUT_FILES["summary_md"]).read_text(), encoding="utf-8")
+    write_readme(paths, argparse.Namespace(**{**vars(args), "confidence_threshold": confidence_threshold, "small_group_min_units": small_group_min_units}))
+    audit = {"generated_at": now_iso(), "command": " ".join(sys.argv), "duration_seconds": time.time() - start, "script_sha256": file_sha256(Path(__file__)), "package_versions": package_versions(), "scope": "30 common-sample WLS/OLS fits; existing high-confidence/small-group estimates reused", "baseline_max_absolute_differences": errors, "same_sample_all": bool(comparison["same_sample_flag"].all()), "n_city_clusters": 48, "protected_output_hashes": protected, "model_infos": new_infos, "input_metadata": {OUTPUT_FILES[k]: file_metadata(out / OUTPUT_FILES[k]) for k in ["model_table_a_parquet", "model_table_b_parquet", "model_table_c_parquet"]}}
+    for name, digest in protected.items():
+        if file_sha256(out / name) != digest:
+            raise AssertionError(f"Protected output changed: {name}")
+    updated_keys = ["robust_unweighted", "table_robust", "robust_summary_table", "robust_primary", "robust_xlsx", "robust_md", "summary_md", "summary_json", "model_explanation_md", "readme"]
+    metadata = {OUTPUT_FILES[k]: file_metadata(out / OUTPUT_FILES[k]) for k in updated_keys}
+    old_log["model_infos"] = infos
+    old_log["weighting_refresh"] = audit
+    old_log["output_metadata"].update(metadata)
+    old_log["output_metadata"] = exclude_provenance_hashes(old_log["output_metadata"])
+    old_log["output_metadata_hash_policy"] = PROVENANCE_HASH_POLICY
+    write_json(out / OUTPUT_FILES["run_log"], old_log)
+    repro = json.loads((out / OUTPUT_FILES["repro"]).read_text())
+    repro["weighting_refresh"] = audit
+    repro["model_formulas"] = model_audit_records(infos)
+    repro["output_metadata"].update(metadata)
+    repro["output_metadata"] = exclude_provenance_hashes(repro["output_metadata"])
+    repro["output_metadata_hash_policy"] = PROVENANCE_HASH_POLICY
+    repro["small_group_policy"] = f"A OD pairs>=30/100; B city-type units>={small_group_min_units}; C units>=30."
+    repro["nan_policy"] = "Model-specific missing outcomes/predictors and non-positive weights are excluded. Both weighting estimators use identical positive-finite-weight formula-complete rows, verified after fitting. Main data rows are not altered upstream."
+    write_json(out / OUTPUT_FILES["repro"], repro)
+    print(json.dumps({"status": "ok", "same_sign_share": float(comparison["same_sign_flag"].mean()), "baseline_max_absolute_differences": errors, "duration_seconds": time.time() - start}, ensure_ascii=False), flush=True)
 
 
 def main() -> None:
@@ -2431,6 +2583,10 @@ def main() -> None:
     paths = get_paths(args.root, args.output_dir)
     paths.output_dir.mkdir(parents=True, exist_ok=True)
     script_path = Path(__file__).resolve()
+
+    if args.refresh_weighting_only:
+        refresh_weighting_only(paths, args)
+        return
 
     inputs = load_inputs(paths)
     main_tables = filter_main_tables(inputs)
@@ -2512,7 +2668,9 @@ def main() -> None:
     write_csv(unweighted_vs_weighted, paths.output_dir / OUTPUT_FILES["robust_unweighted"])
     write_csv(remove_small, paths.output_dir / OUTPUT_FILES["robust_small"])
     write_csv(robust_combined, paths.output_dir / OUTPUT_FILES["table_robust"])
-    robustness_summary_table = build_robustness_summary_table(high_conf, unweighted_vs_weighted, remove_small, robust_infos)
+    primary_contrasts = build_primary_contrasts(model_results, high_conf, robust_combined[robust_combined["scenario"].eq("unweighted")], remove_small)
+    write_csv(primary_contrasts, paths.output_dir / OUTPUT_FILES["robust_primary"])
+    robustness_summary_table = build_robustness_summary_table(high_conf, unweighted_vs_weighted, remove_small, robust_infos, args.confidence_threshold, args.small_group_min_units)
     write_csv(robustness_summary_table, paths.output_dir / OUTPUT_FILES["robust_summary_table"])
     write_robustness_summary(
         paths.output_dir / OUTPUT_FILES["robust_md"],
@@ -2520,6 +2678,8 @@ def main() -> None:
         unweighted_vs_weighted,
         remove_small,
         snap_info,
+        confidence_threshold=args.confidence_threshold,
+        small_group_min_units=args.small_group_min_units,
     )
 
     write_csv(model_results, paths.output_dir / OUTPUT_FILES["table_model"])
@@ -2557,10 +2717,11 @@ def main() -> None:
             "remove_small_groups": remove_small,
             "summary": robustness_summary_table,
             "combined": robust_combined,
+            "primary_contrasts": primary_contrasts,
         },
     )
 
-    summary = build_result_summary(descriptive, city_model_table, model_results, unweighted_vs_weighted, snap_info)
+    summary = build_result_summary(descriptive, city_model_table, model_results, unweighted_vs_weighted, snap_info, args.confidence_threshold)
     write_result_summary(
         paths.output_dir / OUTPUT_FILES["summary_md"],
         paths.output_dir / OUTPUT_FILES["summary_json"],
@@ -2590,7 +2751,8 @@ def main() -> None:
         "snap_info": snap_info,
         "model_infos": model_infos,
         "qc_status_counts": qc["status"].value_counts(dropna=False).to_dict(),
-        "output_metadata": {p.name: file_metadata(p) for p in output_paths if p.exists()},
+        "output_metadata": exclude_provenance_hashes({p.name: file_metadata(p) for p in output_paths if p.exists()}),
+        "output_metadata_hash_policy": PROVENANCE_HASH_POLICY,
     }
     write_json(paths.output_dir / OUTPUT_FILES["run_log"], run_log)
     write_repro(paths, args, script_path, input_report, model_infos, output_paths)

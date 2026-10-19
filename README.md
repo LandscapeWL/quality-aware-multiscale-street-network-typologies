@@ -78,6 +78,26 @@ The full workflow is sequential. Earlier steps create the boundary, data, networ
 
 Notebook cells are provided for documentation and interactive inspection. They should be executed only after the corresponding data inputs are available.
 
+## Step 11 Weighting Robustness
+
+Run the complete statistical-model step after the upstream data are available:
+
+```bash
+python code_upload/11_statistical_models_robustness_checks/step11_model_robustness.py --root "<PROJECT_ROOT>"
+```
+
+To refresh only the weighting comparison from an existing complete Step 11 run:
+
+```bash
+python code_upload/11_statistical_models_robustness_checks/step11_model_robustness.py --root "<PROJECT_ROOT>" --refresh-weighting-only
+```
+
+The refresh requires the saved A/B/C model-table Parquet files, baseline coefficient CSVs, high-confidence and small-group results, result-summary JSON, run log, and reproducibility manifest in `data/11_statistical_models_robustness_checks/`. It fits 15 WLS and 15 OLS specifications using the same positive-finite-weight, formula-complete rows, checks matching observation counts and sample-row hashes, and verifies the refitted WLS estimates against the saved baseline. The manuscript refresh expects 48 city clusters. Existing high-confidence/small-group fits are reused; baseline outputs and figure source data are preserved.
+
+Generated robustness outputs include `robustness_unweighted_vs_weighted.csv`, `robustness_primary_contrasts.csv`, and `robustness_results.xlsx`. Both full and refresh runs write six Excel sheets: `high_confidence`, `unweighted_vs_weighted`, `remove_small_groups`, `summary`, `combined`, and `primary_contrasts`. The primary-contrast file reports coefficients, 95% intervals, and effective samples for MT07–MT10 relative to MT01. B/C contrasts are conditional on the grocery reference category, not averages over facility categories. Overall coefficient sign agreement is an auxiliary diagnostic, not a measure of primary-contrast stability.
+
+These outputs are generated locally and are not included in this code-only repository. The public package retains its English input/output filenames; its script hashes differ from the manuscript workspace's localized source files. Each execution records the script and inputs actually used. The run log and reproducibility manifest exclude both mutable provenance documents from their output-hash inventories to avoid self/cross-referential hashes.
+
 ## Manuscript Scope
 
 The code supports the manuscript's quality-aware, multiscale design:
